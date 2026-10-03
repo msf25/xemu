@@ -352,6 +352,14 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         int64_t end = now + timeout;
         while (now < end) {
+            /*
+             * Keep polling the fds, otherwise events like finished disk I/O
+             * wait until the deadline.
+             */
+            int ret = g_poll(fds, nfds, 0);
+            if (ret != 0) {
+                return ret;
+            }
             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         }
         timeout = 0;
