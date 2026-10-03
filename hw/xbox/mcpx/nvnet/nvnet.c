@@ -36,6 +36,7 @@
 #define MMIO_SIZE 0x400
 #define PHY_ADDR 1
 #define AUTONEG_DURATION_MS 250
+#define RX_POLL_INTERVAL_NS (100 * SCALE_US)
 
 #define GET_MASK(v, mask) (((v) & (mask)) >> ctz32(mask))
 
@@ -71,6 +72,7 @@ typedef struct NvNetState {
     uint8_t rx_dma_buf[RX_ALLOC_BUFSIZE];
 
     QEMUTimer *autoneg_timer;
+    QEMUTimer *rx_poll_timer;
 
     /* Deprecated */
     uint8_t tx_ring_index;
@@ -378,6 +380,19 @@ static bool rx_buf_available(NvNetState *s)
     return desc.flags & NV_RX_AVAIL;
 }
 
+static bool rx_active(NvNetState *s)
+{
+    return rx_enabled(s) && dma_enabled(s) && link_up(s);
+}
+
+static void schedule_rx_poll(NvNetState *s)
+{
+    if (!timer_pending(s->rx_poll_timer)) {
+        timer_mod(s->rx_poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + RX_POLL_INTERVAL_NS);
+    }
+}
+
 static bool nvnet_can_receive(NetClientState *nc)
 {
     NvNetState *s = qemu_get_nic_opaque(nc);
@@ -390,9 +405,32 @@ static bool nvnet_can_receive(NetClientState *nc)
 
     if (!can_rx) {
         trace_nvnet_cant_rx(rx_en, dma_en, link_en, buf_avail);
+
+        /*
+         * The guest refills RX descriptors in memory without telling the
+         * device. Poll the ring like the real NIC so queued packets get
+         * delivered once a buffer is free again.
+         */
+        if (rx_en && dma_en && link_en) {
+            schedule_rx_poll(s);
+        }
     }
 
     return can_rx;
+}
+
+static void flush_rx_queue(NvNetState *s)
+{
+    NetClientState *nc = qemu_get_queue(s->nic);
+
+    if (nvnet_can_receive(nc)) {
+        qemu_flush_queued_packets(nc);
+    }
+}
+
+static void rx_poll_timer_cb(void *opaque)
+{
+    flush_rx_queue(opaque);
 }
 
 static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
@@ -403,7 +441,11 @@ static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
     ssize_t rval;
 
     if (!nvnet_can_receive(nc)) {
-        return -1;
+        /*
+         * Ring full: 0 keeps the packet queued (in order) until
+         * flush_rx_queue, -1 would drop it. Drop only if RX is off.
+         */
+        return rx_active(s) ? 0 : -1;
     }
 
     set_dma_idle(s, false);
@@ -434,7 +476,8 @@ static ssize_t dma_packet_to_guest(NvNetState *s, const uint8_t *buf,
         rval = size;
     } else {
         NVNET_DPRINTF("Could not find free buffer!\n");
-        rval = -1;
+        schedule_rx_poll(s);
+        rval = 0;
     }
 
     set_dma_idle(s, true);
@@ -861,6 +904,13 @@ static void nvnet_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     case NVNET_MII_STATUS:
         set_reg_ext(s, addr, get_reg_ext(s, addr, size) & ~val, size);
         update_irq(s);
+        /* An acked RX interrupt usually means the guest refilled the ring */
+        flush_rx_queue(s);
+        break;
+
+    case NVNET_RECEIVER_CONTROL:
+        set_reg_ext(s, addr, val, size);
+        flush_rx_queue(s);
         break;
 
     case NVNET_IRQ_MASK:
@@ -921,6 +971,7 @@ static void nvnet_realize(PCIDevice *pci_dev, Error **errp)
                           &dev->mem_reentrancy_guard, s);
 
     s->autoneg_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, autoneg_timer, s);
+    s->rx_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rx_poll_timer_cb, s);
 }
 
 static void nvnet_uninit(PCIDevice *dev)
@@ -928,6 +979,7 @@ static void nvnet_uninit(PCIDevice *dev)
     NvNetState *s = NVNET(dev);
     qemu_del_nic(s->nic);
     timer_free(s->autoneg_timer);
+    timer_free(s->rx_poll_timer);
 }
 
 // clang-format off
@@ -976,6 +1028,7 @@ static void nvnet_reset(void *opaque)
     s->tx_dma_buf_offset = 0;
 
     timer_del(s->autoneg_timer);
+    timer_del(s->rx_poll_timer);
 
     if (qemu_get_queue(s->nic)->link_down) {
         update_regs_on_link_down(s);
