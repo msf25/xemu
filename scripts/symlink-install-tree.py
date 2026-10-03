@@ -28,6 +28,11 @@ for source, dest in json.loads(out).items():
     try:
         os.symlink(source, bundle_dest)
     except BaseException as e:
+        if os.name == 'nt' and getattr(e, 'winerror', None) == 1314:
+            # No symlink privilege (Developer Mode off). qemu-bundle is only
+            # needed to run from the build directory, dist/ works without it.
+            print(f'warning: skipping symbolic link {dest}', file=sys.stderr)
+            continue
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':
                 print('Please enable Developer Mode to support soft link '
