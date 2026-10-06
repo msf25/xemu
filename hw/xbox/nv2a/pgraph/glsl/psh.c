@@ -617,6 +617,22 @@ static void add_final_stage_code(struct PixelShader *ps, struct FCInputInfo fina
     ps->varE = ps->varF = NULL;
 }
 
+/*
+ * A shader stage in PROJECT2D mode whose texture format has dimensionality 0 (no valid texture
+ * bound, e.g. a missing bitmap in an unfinished game build). Real hardware keeps rendering;
+ * treat it as 2D instead of aborting, and say so once.
+ */
+static void warn_missing_texture_dimensions(int stage)
+{
+    static bool warned;
+
+    if (!warned) {
+        warned = true;
+        fprintf(stderr, "psh: stage %d samples a texture without dimensions, using a 2D sampler\n",
+                stage);
+    }
+}
+
 static const char *get_sampler_type(struct PixelShader *ps, enum PS_TEXTUREMODES mode, int i)
 {
     const char *sampler2D = "sampler2D";
@@ -632,7 +648,10 @@ static const char *get_sampler_type(struct PixelShader *ps, enum PS_TEXTUREMODES
         return NULL;
 
     case PS_TEXTUREMODES_PROJECT2D:
-        if (dim == 2) {
+        if (dim == 0) {
+            warn_missing_texture_dimensions(i);
+        }
+        if (dim == 2 || dim == 0) {
             if (state->tex_x8y24[i] && ps->opts.vulkan) {
                 return "usampler2D";
             }
@@ -1119,7 +1138,8 @@ static MString* psh_convert(struct PixelShader *ps)
                      (ps->state->conv_tex[i] == CONVOLUTION_FILTER_QUINCUNX))) {
                     apply_convolution_filter(ps, vars, i);
                 } else {
-                    if (ps->state->dim_tex[i] == 2) {
+                    /* dim 0: no valid texture bound, sampled as 2D (see get_sampler_type) */
+                    if (ps->state->dim_tex[i] == 2 || ps->state->dim_tex[i] == 0) {
                         if (ps->state->tex_cubemap[i]) {
                             mstring_append_fmt(
                                 vars,
