@@ -34,7 +34,13 @@ get_version_dot () {
 XEMU_VERSION_MAJOR=$(get_version_dot 1)
 XEMU_VERSION_MINOR=$(get_version_dot 2)
 XEMU_VERSION_PATCH=$(get_version_dot 3)
-XEMU_VERSION_COMMIT=$(get_version_field 2)
+# Commits since the tag: second to last field of "<tag>-<n>-g<hash>". Taken from the end so that
+# tags with a suffix (v1.2.3-name.1) still work. version.rc needs a number, fall back to 0.
+XEMU_VERSION_COMMIT=${XEMU_VERSION%-g*}
+XEMU_VERSION_COMMIT=${XEMU_VERSION_COMMIT##*-}
+if ! [[ "${XEMU_VERSION_COMMIT}" =~ ^[0-9]+$ ]]; then
+  XEMU_VERSION_COMMIT=0
+fi
 
 cat <<EOF
 #define XEMU_VERSION       "$XEMU_VERSION"
